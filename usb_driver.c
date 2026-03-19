@@ -1,25 +1,39 @@
 #include <linux/usb.h>
 #include <linux/module.h>
 
-static struct usb_device *device;
+struct usb_mydev {
+	struct usb_device *udev;
+	struct usb_interface *interface;
+};
 
 static struct usb_device_id usb_table[] = {
   {USB_DEVICE(0x346d, 0x5678)},
   {}
 };
 
-MODULE_DEVICE_TABLE(usb, usb_table);
+MODULE_DEVICE_TABLE(usb, usb_table); // For automatice driver loading
 
 static int usb_probe(struct usb_interface *interface, const struct usb_device_id *id) {
   struct usb_host_interface *iface_desc;
   struct usb_endpoint_descriptor *endpoint;
   
+  struct usb_mydev *dev;
+  
+  dev = kmalloc(sizeof(struct usb_mydev), GFP_KERNEL);
+  if (!dev) {
+  	pr_err("Cannot allocate memory for my device\n");
+  	return -ENOMEM;
+  }
+  
+  dev->udev = usb_get_dev(interface_to_usbdev(interface));
+  dev->interface = interface;
+  
+  usb_set_intfdata(interface, dev);
+  
   iface_desc = interface->cur_altsetting;
   
-  device = interface_to_usbdev(interface);
-  
-  pr_info("Pen drive i/f %d now probed: {%04X:%04X}\n",
-  iface_desc->desc.bInterfaceNumber, device->descriptor.idVendor, device->descriptor.idProduct);
+  pr_info("Device plugged: {%04X:%04X}\n",
+  dev->udev->descriptor.idVendor, dev->udev->descriptor.idProduct);
   
   pr_info("Number of endpoints: %02X\n", iface_desc->desc.bNumEndpoints);
   
@@ -58,7 +72,17 @@ static int usb_probe(struct usb_interface *interface, const struct usb_device_id
 }
 
 static void usb_disconnect(struct usb_interface *interface) {
-  usb_put_dev(device);
+	struct usb_mydev *dev;
+	
+	dev = usb_get_intfdata(interface);
+	
+	usb_set_intfdata(interface, NULL);
+	
+	if (dev) {
+  	usb_put_dev(dev->udev);
+  	kfree(dev);
+  }
+  
   pr_info("Pen drive removed\n");
 }
 
