@@ -4,6 +4,11 @@
 struct usb_mydev {
 	struct usb_device *udev;
 	struct usb_interface *interface;
+	
+	__u8 bulk_in_endpointAddr;
+	__u8 bulk_out_endpointAddr;
+	
+	size_t bulk_in_size;
 };
 
 static struct usb_device_id usb_table[] = {
@@ -39,6 +44,9 @@ static int usb_probe(struct usb_interface *interface, const struct usb_device_id
   
   pr_info("Interface class: %02X\n", iface_desc->desc.bInterfaceClass);
   
+  dev->bulk_in_endpointAddr = 0;
+	dev->bulk_out_endpointAddr = 0;
+  
   for (int i = 0; i < iface_desc->desc.bNumEndpoints; i++) {
     endpoint = &iface_desc->endpoint[i].desc;
     
@@ -49,23 +57,43 @@ static int usb_probe(struct usb_interface *interface, const struct usb_device_id
     
     // Direction
     if (usb_endpoint_dir_in(endpoint))
-        pr_info("  Direction: IN\n");
+    	pr_info("  Direction: IN\n");
     else
-        pr_info("  Direction: OUT\n");
+			pr_info("  Direction: OUT\n");
     
     // Transfer type
-    if (usb_endpoint_xfer_bulk(endpoint))
-        pr_info("  Type: Bulk\n");
+    if (usb_endpoint_xfer_bulk(endpoint)) {
+    	pr_info("  Type: Bulk\n");
+    	
+    	if (usb_endpoint_is_bulk_in(endpoint)) {
+    		dev->bulk_in_endpointAddr = endpoint->bEndpointAddress;
+    		dev->bulk_in_size = le16_to_cpu(endpoint->wMaxPacketSize);
+    		
+    		pr_info("  --> Stored as BULK IN endpoint\n");
+    	}
+    	
+    	if (usb_endpoint_is_bulk_out(endpoint)) {
+    		dev->bulk_out_endpointAddr = endpoint->bEndpointAddress;
+    		
+    		pr_info("  --> Stored as BULK OUT endpoint\n");
+    	}
+    }
     else if (usb_endpoint_xfer_int(endpoint))
-        pr_info("  Type: Interrupt\n");
+			pr_info("  Type: Interrupt\n");
     else if (usb_endpoint_xfer_control(endpoint))
-        pr_info("  Type: Control\n");
+			pr_info("  Type: Control\n");
     else if (usb_endpoint_xfer_isoc(endpoint))
-        pr_info("  Type: Isochronous\n");
+			pr_info("  Type: Isochronous\n");
     
     // Packet size    
     pr_info("  MaxPacketSize: %d\n",
-            le16_to_cpu(endpoint->wMaxPacketSize));
+			le16_to_cpu(endpoint->wMaxPacketSize));
+  }
+  
+  if (!(dev->bulk_in_endpointAddr && dev->bulk_out_endpointAddr)) {
+  	pr_err("Could not find both bulk-in and bulk-out endpoints\n");
+  	kfree(dev);
+  	return -ENODEV;
   }
   
   return 0;
