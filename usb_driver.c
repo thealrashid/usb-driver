@@ -2,14 +2,21 @@
 #include <linux/module.h>
 
 struct usb_mydev {
-	struct usb_device *udev;
+	struct usb_device    *udev;
 	struct usb_interface *interface;
 	
-	__u8 bulk_in_endpointAddr;
-	__u8 bulk_out_endpointAddr;
+	/* Endpoints */
+	__u8                 bulk_in_endpointAddr;
+	__u8                 bulk_out_endpointAddr;
 	
-	size_t bulk_in_size;
-	unsigned char *bulk_in_buffer;
+	size_t               bulk_in_size;
+	unsigned char        *bulk_in_buffer;
+	
+	/* syncronization */
+	struct mutex         io_mutex;
+	
+	/* state */
+	bool                 disconnected;
 };
 
 static struct usb_device_id usb_table[] = {
@@ -41,6 +48,9 @@ static int usb_probe(struct usb_interface *interface, const struct usb_device_id
   
   dev->udev = usb_get_dev(interface_to_usbdev(interface));
   dev->interface = interface;
+  
+  mutex_init(&dev->io_mutex);
+  dev->disconnected = false;
   
   usb_set_intfdata(interface, dev);
   
@@ -78,6 +88,12 @@ static int usb_probe(struct usb_interface *interface, const struct usb_device_id
     		dev->bulk_in_endpointAddr = endpoint->bEndpointAddress;
     		dev->bulk_in_size = le16_to_cpu(endpoint->wMaxPacketSize);
     		
+    		dev->bulk_in_buffer = kzalloc(dev->bulk_in_size, GFP_KERNEL);
+				if (!dev->bulk_in_buffer) {
+					pr_err("Could not allocate bulk_in_buffer\n");
+					goto error;
+				}
+    		
     		pr_info("  --> Stored as BULK IN endpoint\n");
     	}
     	
@@ -107,15 +123,6 @@ static int usb_probe(struct usb_interface *interface, const struct usb_device_id
   }
   
   pr_info("Using endpoints: IN=0x%02X OUT=0x%02X\n", dev->bulk_in_endpointAddr, dev->bulk_out_endpointAddr);
-  
-  dev->bulk_in_buffer = kzalloc(dev->bulk_in_size, GFP_KERNEL);
-  if (!dev->bulk_in_buffer) {
-  	pr_err("Could not allocate bulk_in_buffer\n");
-  	
-  	usb_put_dev(dev->udev);
-  	kfree(dev);
-  	return -ENOMEM;
-  }
   
   retval_in = usb_bulk_msg(dev->udev,
   					usb_rcvbulkpipe(dev->udev, dev->bulk_in_endpointAddr),
@@ -176,10 +183,11 @@ static void usb_disconnect(struct usb_interface *interface) {
 	struct usb_mydev *dev;
 	
 	dev = usb_get_intfdata(interface);
-	
 	usb_set_intfdata(interface, NULL);
 	
 	if (dev) {
+		dev->disconnected = true;
+		
 		kfree(dev->bulk_in_buffer);
   	usb_put_dev(dev->udev);
   	kfree(dev);
