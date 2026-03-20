@@ -23,13 +23,17 @@ static int usb_probe(struct usb_interface *interface, const struct usb_device_id
   struct usb_host_interface *iface_desc;
   struct usb_endpoint_descriptor *endpoint;
   
+  int retval;
   int retval_in;
   int actual_length;
   int retval_out;
   
+  char *data;
+	int data_len = strlen("Hello USB");
+  
   struct usb_mydev *dev;
   
-  dev = kmalloc(sizeof(struct usb_mydev), GFP_KERNEL);
+  dev = kzalloc(sizeof(struct usb_mydev), GFP_KERNEL);
   if (!dev) {
   	pr_err("Cannot allocate memory for my device\n");
   	return -ENOMEM;
@@ -97,9 +101,12 @@ static int usb_probe(struct usb_interface *interface, const struct usb_device_id
   
   if (!(dev->bulk_in_endpointAddr && dev->bulk_out_endpointAddr)) {
   	pr_err("Could not find both bulk-in and bulk-out endpoints\n");
+  	usb_put_dev(dev->udev);
   	kfree(dev);
   	return -ENODEV;
   }
+  
+  pr_info("Using endpoints: IN=0x%02X OUT=0x%02X\n", dev->bulk_in_endpointAddr, dev->bulk_out_endpointAddr);
   
   dev->bulk_in_buffer = kzalloc(dev->bulk_in_size, GFP_KERNEL);
   if (!dev->bulk_in_buffer) {
@@ -118,7 +125,7 @@ static int usb_probe(struct usb_interface *interface, const struct usb_device_id
   					1000); // timeout in ms
   
   if (retval_in) {
-  	pr_err("Bulk read failed with error %d\n", retval_in);
+  	pr_err("Bulk read failed: %d (%pe)\n", retval_in, ERR_PTR(retval_in));
   } else {
   	pr_info("Bulk read successful, received %d bytes\n", actual_length);
   	
@@ -128,14 +135,12 @@ static int usb_probe(struct usb_interface *interface, const struct usb_device_id
   	}
   	pr_info("\n");
   }
-  
-  char *data;
-	int data_len = 10;
 	
 	data = kmalloc(data_len, GFP_KERNEL);
 	if (!data) {
 		pr_err("Failed to allocate write buffer\n");
-		return -ENOMEM;
+		retval = -ENOMEM;
+		goto error;
 	}
 
 	memcpy(data, "Hello USB", data_len);
@@ -148,12 +153,23 @@ static int usb_probe(struct usb_interface *interface, const struct usb_device_id
   							1000);
   
   if (retval_out) {
-		pr_err("Bulk write failed with error %d\n", retval_out);
+		pr_err("Bulk write failed: %d (%pe)\n", retval_out, ERR_PTR(retval_out));
 	} else {
 		pr_info("Bulk write successful\n");
 	}
+	
+	kfree(data);
   
   return 0;
+  
+  error:
+  usb_set_intfdata(interface, NULL);
+  if (dev) {
+		kfree(dev->bulk_in_buffer);
+		usb_put_dev(dev->udev);
+		kfree(dev);
+	}
+	return retval;
 }
 
 static void usb_disconnect(struct usb_interface *interface) {
