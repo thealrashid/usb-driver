@@ -9,6 +9,7 @@ struct usb_mydev {
 	__u8 bulk_out_endpointAddr;
 	
 	size_t bulk_in_size;
+	unsigned char *bulk_in_buffer;
 };
 
 static struct usb_device_id usb_table[] = {
@@ -21,6 +22,10 @@ MODULE_DEVICE_TABLE(usb, usb_table); // For automatice driver loading
 static int usb_probe(struct usb_interface *interface, const struct usb_device_id *id) {
   struct usb_host_interface *iface_desc;
   struct usb_endpoint_descriptor *endpoint;
+  
+  int retval_in;
+  int actual_length;
+  int retval_out;
   
   struct usb_mydev *dev;
   
@@ -96,6 +101,58 @@ static int usb_probe(struct usb_interface *interface, const struct usb_device_id
   	return -ENODEV;
   }
   
+  dev->bulk_in_buffer = kzalloc(dev->bulk_in_size, GFP_KERNEL);
+  if (!dev->bulk_in_buffer) {
+  	pr_err("Could not allocate bulk_in_buffer\n");
+  	
+  	usb_put_dev(dev->udev);
+  	kfree(dev);
+  	return -ENOMEM;
+  }
+  
+  retval_in = usb_bulk_msg(dev->udev,
+  					usb_rcvbulkpipe(dev->udev, dev->bulk_in_endpointAddr),
+  					dev->bulk_in_buffer,
+  					dev->bulk_in_size,
+  					&actual_length,
+  					1000); // timeout in ms
+  
+  if (retval_in) {
+  	pr_err("Bulk read failed with error %d\n", retval_in);
+  } else {
+  	pr_info("Bulk read successful, received %d bytes\n", actual_length);
+  	
+  	// Print received data (hex)
+  	for (int i = 0; i < actual_length; i++) {
+  		pr_info("0x%02X ", dev->bulk_in_buffer[i]);
+  	}
+  	pr_info("\n");
+  }
+  
+  char *data;
+	int data_len = 10;
+	
+	data = kmalloc(data_len, GFP_KERNEL);
+	if (!data) {
+		pr_err("Failed to allocate write buffer\n");
+		return -ENOMEM;
+	}
+
+	memcpy(data, "Hello USB", data_len);
+  
+  retval_out = usb_bulk_msg(dev->udev,
+  							usb_sndbulkpipe(dev->udev, dev->bulk_out_endpointAddr),
+  							data,
+  							data_len,
+  							NULL,
+  							1000);
+  
+  if (retval_out) {
+		pr_err("Bulk write failed with error %d\n", retval_out);
+	} else {
+		pr_info("Bulk write successful\n");
+	}
+  
   return 0;
 }
 
@@ -107,6 +164,7 @@ static void usb_disconnect(struct usb_interface *interface) {
 	usb_set_intfdata(interface, NULL);
 	
 	if (dev) {
+		kfree(dev->bulk_in_buffer);
   	usb_put_dev(dev->udev);
   	kfree(dev);
   }
