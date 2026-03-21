@@ -1,5 +1,10 @@
 #include <linux/usb.h>
 #include <linux/module.h>
+#include <linux/init.h>
+
+#include <linux/fs.h>        // alloc_chrdev_region, file_operations
+#include <linux/cdev.h>      // cdev_init, cdev_add, cdev_del
+#include <linux/device.h>    // class_create, device_create
 
 struct usb_mydev {
 	struct usb_device    *udev;
@@ -25,6 +30,38 @@ static struct usb_device_id usb_table[] = {
 };
 
 MODULE_DEVICE_TABLE(usb, usb_table); // For automatice driver loading
+
+static dev_t dev_number;
+static struct cdev my_cdev;
+static struct class *my_class;
+
+static int my_open(struct inode *inode, struct file *file) {
+	pr_info("Device opened\n");
+	return 0;
+}
+
+static int my_release(struct inode *inode, struct file *file) {
+	pr_info("Device closed\n");
+	return 0;
+}
+
+static ssize_t my_read(struct file *file, char __user *buf, size_t len, loff_t *offset) {
+	pr_info("Read called\n");
+	return 0;
+}
+
+static ssize_t my_write(struct file *file, const char __user *buf, size_t len, loff_t *offset) {
+	pr_info("Write called\n");
+	return 0;
+}
+
+static struct file_operations fops = {
+	.owner = THIS_MODULE,
+	.open = my_open,
+	.release = my_release,
+	.read = my_read,
+	.write = my_write,
+};
 
 static int usb_probe(struct usb_interface *interface, const struct usb_device_id *id) {
   struct usb_host_interface *iface_desc;
@@ -214,12 +251,56 @@ static int __init usb_module_init(void) {
   
   pr_info("USB module initialized\n");
   
+  /* Allocating major/minor numbers */
+  if (alloc_chrdev_region(&dev_number, 0, 1, "my_usb_dev") < 0) {
+  	pr_err("Cannot allocate chrdev\n");
+  	return -1;
+  }
+  
+  /* Init cdev */
+  cdev_init(&my_cdev, &fops);
+  
+  /* Add cdev*/
+  if (cdev_add(&my_cdev, dev_number, 1) < 0) {
+  	pr_err("Cannot add cdev\n");
+  	goto unregister_chrdev;
+  }
+  
+  /* Create class*/
+  my_class = class_create("my_usb_class");
+  if (IS_ERR(my_class)) {
+  	pr_err("Cannot create class\n");
+  	goto del_cdev;
+  }
+  
+  /* Create device node*/
+  if (device_create(my_class, NULL, dev_number, NULL, "my_usb_device") == NULL) {
+  	pr_err("Cannot create device\n");
+  	goto destroy_class;
+  }
+  
+  pr_info("Char device created successfully\n");
+  
   return 0;
+  
+  destroy_class:
+  	class_destroy(my_class);
+  del_cdev:
+  	cdev_del(&my_cdev);
+  unregister_chrdev:
+  	unregister_chrdev_region(dev_number, 1);
+  	return -1;
 }
 
 static void __exit usb_module_exit(void) {
   usb_deregister(&my_usb_driver);
   pr_info("USB module exited\n");
+  
+  device_destroy(my_class, dev_number);
+	class_destroy(my_class);
+	cdev_del(&my_cdev);
+	unregister_chrdev_region(dev_number, 1);
+	pr_info("Char device destroyed\n");
 }
 
 module_init(usb_module_init);
