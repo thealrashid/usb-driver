@@ -10,12 +10,15 @@ struct usb_mydev {
 	struct usb_device    *udev;
 	struct usb_interface *interface;
 	
-	/* Endpoints */
-	__u8                 bulk_in_endpointAddr;
-	__u8                 bulk_out_endpointAddr;
-	
-	size_t               bulk_in_size;
-	unsigned char        *bulk_in_buffer;
+	/* Bulk IN endpoint */
+	unsigned char           bulk_in_endpointAddr;
+	size_t                  bulk_in_size;
+	unsigned char           *bulk_in_buffer;
+
+	/* Bulk OUT endpoint */
+	unsigned char           bulk_out_endpointAddr;
+	size_t                  bulk_out_size;
+	unsigned char           *bulk_out_buffer;
 	
 	/* syncronization */
 	struct mutex         io_mutex;
@@ -31,28 +34,139 @@ static struct usb_device_id usb_table[] = {
 
 MODULE_DEVICE_TABLE(usb, usb_table); // For automatice driver loading
 
+static struct usb_mydev *global_dev;
+
 static dev_t dev_number;
 static struct cdev my_cdev;
 static struct class *my_class;
 
 static int my_open(struct inode *inode, struct file *file) {
-	pr_info("Device opened\n");
+	struct usb_mydev *dev;
+	
+	dev = global_dev;
+	
+	if (!dev) {
+		pr_err("Device not present\n");
+		return -ENODEV;
+	}
+	
+	if (dev->disconnected) {
+		pr_err("Device disconnected\n");
+		return -ENODEV;
+	}
+	
+	file->private_data = dev;
+	
+	pr_info("Device opened successfully\n");
 	return 0;
 }
 
 static int my_release(struct inode *inode, struct file *file) {
+	file->private_data = NULL;
+	
 	pr_info("Device closed\n");
 	return 0;
 }
 
 static ssize_t my_read(struct file *file, char __user *buf, size_t len, loff_t *offset) {
-	pr_info("Read called\n");
-	return 0;
+	struct usb_mydev *dev;
+	int retval;
+	int read_cnt;
+	
+	dev = file->private_data;
+	
+	if (!dev) {
+		return -ENODEV;
+	}
+	
+	/* Lock */
+	mutex_lock(&dev->io_mutex);
+	
+	if (dev->disconnected) {
+		mutex_unlock(&dev->io_mutex);
+		return -ENODEV;
+	}
+	
+	/* Limit size */
+	if (len > dev->bulk_in_size) {
+		len = dev->bulk_in_size;
+	}
+	
+	/* Read from USB */
+	retval = usb_bulk_msg(dev->udev,
+					 usb_rcvbulkpipe(dev->udev, dev->bulk_in_endpointAddr),
+					 dev->bulk_in_buffer,
+					 len,
+					 &read_cnt,
+					 2000);
+	if (retval) {
+		pr_err("Bulk read failed: %d (%pe)\n", retval, ERR_PTR(retval));
+		mutex_unlock(&dev->io_mutex);
+		return retval;
+	}
+	
+	/* Copy to user */
+	if (copy_to_user(buf, dev->bulk_in_buffer, read_cnt)) {
+		mutex_unlock(&dev->io_mutex);
+		return -EFAULT;
+	}
+	
+	pr_info("Read %d bytes from USB device\n", read_cnt);
+	
+	mutex_unlock(&dev->io_mutex);
+	
+	return read_cnt;
 }
 
 static ssize_t my_write(struct file *file, const char __user *buf, size_t len, loff_t *offset) {
-	pr_info("Write called\n");
-	return 0;
+	struct usb_mydev *dev;
+	int retval;
+	int wrote_cnt;
+	
+	dev = file->private_data;
+	
+	if (!dev) {
+		return -ENODEV;
+	}
+	
+	/* Lock */
+	mutex_lock(&dev->io_mutex);
+	
+	if (dev->disconnected) {
+		mutex_unlock(&dev->io_mutex);
+		return -ENODEV;
+	}
+	
+	/* Limit size */
+	if (len > dev->bulk_out_size) {
+		len = dev->bulk_out_size;
+	}
+	
+	/* Copy from user */
+	if (copy_from_user(dev->bulk_out_buffer, buf, len)) {
+		mutex_unlock(&dev->io_mutex);
+		return -EFAULT;
+	}
+	
+	/* Send data via USB */
+	retval = usb_bulk_msg(dev->udev,
+					 usb_sndbulkpipe(dev->udev, dev->bulk_out_endpointAddr),
+					 dev->bulk_out_buffer,
+					 len,
+					 &wrote_cnt,
+					 1000);
+	
+	if (retval) {
+		pr_err("Bulk write failed: %d (%pe)\n", retval, ERR_PTR(retval));
+		mutex_unlock(&dev->io_mutex);
+		return retval;
+	}
+	
+	pr_info("Wrote %d bytes to USB device\n", wrote_cnt);
+	
+	mutex_unlock(&dev->io_mutex);
+	
+	return wrote_cnt;
 }
 
 static struct file_operations fops = {
@@ -68,12 +182,6 @@ static int usb_probe(struct usb_interface *interface, const struct usb_device_id
   struct usb_endpoint_descriptor *endpoint;
   
   int retval;
-  int retval_in;
-  int actual_length;
-  int retval_out;
-  
-  char *data;
-	int data_len = strlen("Hello USB");
   
   struct usb_mydev *dev;
   
@@ -115,7 +223,7 @@ static int usb_probe(struct usb_interface *interface, const struct usb_device_id
     if (usb_endpoint_dir_in(endpoint))
     	pr_info("  Direction: IN\n");
     else
-			pr_info("  Direction: OUT\n");
+		pr_info("  Direction: OUT\n");
     
     // Transfer type
     if (usb_endpoint_xfer_bulk(endpoint)) {
@@ -136,6 +244,13 @@ static int usb_probe(struct usb_interface *interface, const struct usb_device_id
     	
     	if (usb_endpoint_is_bulk_out(endpoint)) {
     		dev->bulk_out_endpointAddr = endpoint->bEndpointAddress;
+    		dev->bulk_out_size = le16_to_cpu(endpoint->wMaxPacketSize);
+    		
+    		dev->bulk_out_buffer = kzalloc(dev->bulk_out_size, GFP_KERNEL);
+    		if (!dev->bulk_out_buffer) {
+    			pr_err("Could not allocate bulk_out_buffer\n");
+    			goto error;
+    		}
     		
     		pr_info("  --> Stored as BULK OUT endpoint\n");
     	}
@@ -148,8 +263,7 @@ static int usb_probe(struct usb_interface *interface, const struct usb_device_id
 			pr_info("  Type: Isochronous\n");
     
     // Packet size    
-    pr_info("  MaxPacketSize: %d\n",
-			le16_to_cpu(endpoint->wMaxPacketSize));
+    pr_info("  MaxPacketSize: %d\n", le16_to_cpu(endpoint->wMaxPacketSize));
   }
   
   if (!(dev->bulk_in_endpointAddr && dev->bulk_out_endpointAddr)) {
@@ -161,48 +275,7 @@ static int usb_probe(struct usb_interface *interface, const struct usb_device_id
   
   pr_info("Using endpoints: IN=0x%02X OUT=0x%02X\n", dev->bulk_in_endpointAddr, dev->bulk_out_endpointAddr);
   
-  retval_in = usb_bulk_msg(dev->udev,
-  					usb_rcvbulkpipe(dev->udev, dev->bulk_in_endpointAddr),
-  					dev->bulk_in_buffer,
-  					dev->bulk_in_size,
-  					&actual_length,
-  					1000); // timeout in ms
-  
-  if (retval_in) {
-  	pr_err("Bulk read failed: %d (%pe)\n", retval_in, ERR_PTR(retval_in));
-  } else {
-  	pr_info("Bulk read successful, received %d bytes\n", actual_length);
-  	
-  	// Print received data (hex)
-  	for (int i = 0; i < actual_length; i++) {
-  		pr_info("0x%02X ", dev->bulk_in_buffer[i]);
-  	}
-  	pr_info("\n");
-  }
-	
-	data = kmalloc(data_len, GFP_KERNEL);
-	if (!data) {
-		pr_err("Failed to allocate write buffer\n");
-		retval = -ENOMEM;
-		goto error;
-	}
-
-	memcpy(data, "Hello USB", data_len);
-  
-  retval_out = usb_bulk_msg(dev->udev,
-  							usb_sndbulkpipe(dev->udev, dev->bulk_out_endpointAddr),
-  							data,
-  							data_len,
-  							NULL,
-  							1000);
-  
-  if (retval_out) {
-		pr_err("Bulk write failed: %d (%pe)\n", retval_out, ERR_PTR(retval_out));
-	} else {
-		pr_info("Bulk write successful\n");
-	}
-	
-	kfree(data);
+  global_dev = dev;
   
   return 0;
   
@@ -229,6 +302,7 @@ static void usb_disconnect(struct usb_interface *interface) {
   	usb_put_dev(dev->udev);
   	kfree(dev);
   }
+  
   
   pr_info("Pen drive removed\n");
 }
