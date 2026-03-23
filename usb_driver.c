@@ -6,6 +6,9 @@
 #include <linux/cdev.h>      // cdev_init, cdev_add, cdev_del
 #include <linux/device.h>    // class_create, device_create
 
+#include <linux/slab.h>
+#include <linux/mutex.h>
+
 struct usb_mydev {
 	struct usb_device    *udev;
 	struct usb_interface *interface;
@@ -19,6 +22,10 @@ struct usb_mydev {
 	unsigned char           bulk_out_endpointAddr;
 	size_t                  bulk_out_size;
 	unsigned char           *bulk_out_buffer;
+	
+	/* Char device */
+	struct cdev             cdev;
+	dev_t                   devt;
 	
 	/* syncronization */
 	struct mutex         io_mutex;
@@ -34,16 +41,13 @@ static struct usb_device_id usb_table[] = {
 
 MODULE_DEVICE_TABLE(usb, usb_table); // For automatice driver loading
 
-static struct usb_mydev *global_dev;
-
 static dev_t dev_number;
-static struct cdev my_cdev;
 static struct class *my_class;
 
 static int my_open(struct inode *inode, struct file *file) {
 	struct usb_mydev *dev;
 	
-	dev = global_dev;
+	dev = container_of(inode->i_cdev, struct usb_mydev, cdev);
 	
 	if (!dev) {
 		pr_err("Device not present\n");
@@ -77,6 +81,10 @@ static ssize_t my_read(struct file *file, char __user *buf, size_t len, loff_t *
 	
 	if (!dev) {
 		return -ENODEV;
+	}
+	
+	if (len == 0) {
+	 return 0;
 	}
 	
 	/* Lock */
@@ -127,6 +135,10 @@ static ssize_t my_write(struct file *file, const char __user *buf, size_t len, l
 	
 	if (!dev) {
 		return -ENODEV;
+	}
+	
+	if (len == 0) {
+	 return 0;
 	}
 	
 	/* Lock */
@@ -197,8 +209,6 @@ static int usb_probe(struct usb_interface *interface, const struct usb_device_id
   mutex_init(&dev->io_mutex);
   dev->disconnected = false;
   
-  usb_set_intfdata(interface, dev);
-  
   iface_desc = interface->cur_altsetting;
   
   pr_info("Device plugged: {%04X:%04X}\n",
@@ -236,7 +246,7 @@ static int usb_probe(struct usb_interface *interface, const struct usb_device_id
     		dev->bulk_in_buffer = kzalloc(dev->bulk_in_size, GFP_KERNEL);
 				if (!dev->bulk_in_buffer) {
 					pr_err("Could not allocate bulk_in_buffer\n");
-					goto error;
+					goto error_buf;
 				}
     		
     		pr_info("  --> Stored as BULK IN endpoint\n");
@@ -249,7 +259,7 @@ static int usb_probe(struct usb_interface *interface, const struct usb_device_id
     		dev->bulk_out_buffer = kzalloc(dev->bulk_out_size, GFP_KERNEL);
     		if (!dev->bulk_out_buffer) {
     			pr_err("Could not allocate bulk_out_buffer\n");
-    			goto error;
+    			goto error_buf;
     		}
     		
     		pr_info("  --> Stored as BULK OUT endpoint\n");
@@ -268,25 +278,48 @@ static int usb_probe(struct usb_interface *interface, const struct usb_device_id
   
   if (!(dev->bulk_in_endpointAddr && dev->bulk_out_endpointAddr)) {
   	pr_err("Could not find both bulk-in and bulk-out endpoints\n");
-  	usb_put_dev(dev->udev);
-  	kfree(dev);
-  	return -ENODEV;
+  	
+  	retval = -ENODEV;
+  	goto error_buf;
   }
   
   pr_info("Using endpoints: IN=0x%02X OUT=0x%02X\n", dev->bulk_in_endpointAddr, dev->bulk_out_endpointAddr);
   
-  global_dev = dev;
+  dev->devt = dev_number;
+  
+  cdev_init(&dev->cdev, &fops);
+  dev->cdev.owner = THIS_MODULE;
+  
+  retval = cdev_add(&dev->cdev, dev->devt, 1);
+  if (retval) {
+  	pr_err("Failed to add cdev\n");
+  	goto error_buf;
+  }
+  
+  /* Create device node*/
+  if (IS_ERR(device_create(my_class, &interface->dev, dev->devt, NULL, "my_usb_device"))) {
+  	pr_err("Cannot create device\n");
+  	retval = -EINVAL;
+  	goto error_device;
+  }
+  
+  usb_set_intfdata(interface, dev);
+  
+  pr_info("Char device created successfully\n");
   
   return 0;
   
-  error:
-  usb_set_intfdata(interface, NULL);
-  if (dev) {
+  error_device:
+  	cdev_del(&dev->cdev);
+  
+  error_buf:
+		kfree(dev->bulk_out_buffer);
 		kfree(dev->bulk_in_buffer);
+	
 		usb_put_dev(dev->udev);
 		kfree(dev);
-	}
-	return retval;
+		
+		return retval;
 }
 
 static void usb_disconnect(struct usb_interface *interface) {
@@ -295,14 +328,20 @@ static void usb_disconnect(struct usb_interface *interface) {
 	dev = usb_get_intfdata(interface);
 	usb_set_intfdata(interface, NULL);
 	
-	if (dev) {
-		dev->disconnected = true;
-		
-		kfree(dev->bulk_in_buffer);
-  	usb_put_dev(dev->udev);
-  	kfree(dev);
-  }
+	if (!dev) {
+		return;
+	}
+	
+	dev->disconnected = true;
+	
+	device_destroy(my_class, dev->devt);
+  cdev_del(&dev->cdev);
   
+  kfree(dev->bulk_in_buffer);
+  kfree(dev->bulk_out_buffer);
+  
+  usb_put_dev(dev->udev);
+  kfree(dev);
   
   pr_info("Pen drive removed\n");
 }
@@ -316,11 +355,12 @@ static struct usb_driver my_usb_driver = {
 };
 
 static int __init usb_module_init(void) {
-  int result = usb_register(&my_usb_driver);
+  int result;
   
+  result = usb_register(&my_usb_driver);
   if (result < 0) {
     pr_err("USB registration failed for %s\n", my_usb_driver.name);
-    return -1;
+    return -result;
   }
   
   pr_info("USB module initialized\n");
@@ -328,51 +368,27 @@ static int __init usb_module_init(void) {
   /* Allocating major/minor numbers */
   if (alloc_chrdev_region(&dev_number, 0, 1, "my_usb_dev") < 0) {
   	pr_err("Cannot allocate chrdev\n");
+  	usb_deregister(&my_usb_driver);
   	return -1;
-  }
-  
-  /* Init cdev */
-  cdev_init(&my_cdev, &fops);
-  
-  /* Add cdev*/
-  if (cdev_add(&my_cdev, dev_number, 1) < 0) {
-  	pr_err("Cannot add cdev\n");
-  	goto unregister_chrdev;
   }
   
   /* Create class*/
   my_class = class_create("my_usb_class");
   if (IS_ERR(my_class)) {
   	pr_err("Cannot create class\n");
-  	goto del_cdev;
+  	unregister_chrdev_region(dev_number, 1);
+		usb_deregister(&my_usb_driver);
+  	return -1;
   }
-  
-  /* Create device node*/
-  if (device_create(my_class, NULL, dev_number, NULL, "my_usb_device") == NULL) {
-  	pr_err("Cannot create device\n");
-  	goto destroy_class;
-  }
-  
-  pr_info("Char device created successfully\n");
   
   return 0;
-  
-  destroy_class:
-  	class_destroy(my_class);
-  del_cdev:
-  	cdev_del(&my_cdev);
-  unregister_chrdev:
-  	unregister_chrdev_region(dev_number, 1);
-  	return -1;
 }
 
 static void __exit usb_module_exit(void) {
   usb_deregister(&my_usb_driver);
   pr_info("USB module exited\n");
   
-  device_destroy(my_class, dev_number);
 	class_destroy(my_class);
-	cdev_del(&my_cdev);
 	unregister_chrdev_region(dev_number, 1);
 	pr_info("Char device destroyed\n");
 }
