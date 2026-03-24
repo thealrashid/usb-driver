@@ -1,0 +1,23 @@
+{
+    "configurations": [
+        {
+            "name": "Linux",
+            "includePath": [
+                "${workspaceFolder}/**",
+                "/usr/src/linux-headers-6.17.0-19-generic/include",
+                "/usr/src/linux-headers-6.17.0-19-generic/include/uapi",
+                "/usr/src/linux-headers-6.17.0-19-generic/include/generated/uapi",
+                "/usr/src/linux-headers-6.17.0-19-generic/arch/x86/include",
+                "/usr/src/linux-headers-6.17.0-19-generic/arch/x86/include/generated",
+                "/usr/src/linux-headers-6.17.0-19-generic/arch/x86/include/uapi",
+                "/usr/src/linux-headers-6.17.0-19-generic/arch/x86/include/generated/uapi"
+            ],
+            "defines": [],
+            "compilerPath": "/usr/bin/gcc",
+            "cStandard": "c17",
+            "cppStandard": "gnu++17",
+            "intelliSenseMode": "linux-gcc-x64"
+        }
+    ],
+    "version": 4
+}

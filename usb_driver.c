@@ -8,6 +8,7 @@
 
 #include <linux/slab.h>
 #include <linux/mutex.h>
+#include <linux/idr.h>
 
 struct usb_mydev {
 	struct usb_device    *udev;
@@ -26,6 +27,7 @@ struct usb_mydev {
 	/* Char device */
 	struct cdev             cdev;
 	dev_t                   devt;
+	int                     minor;
 	
 	/* syncronization */
 	struct mutex         io_mutex;
@@ -41,8 +43,9 @@ static struct usb_device_id usb_table[] = {
 
 MODULE_DEVICE_TABLE(usb, usb_table); // For automatice driver loading
 
-static dev_t dev_number;
 static struct class *my_class;
+static DEFINE_IDA(usb_minor_ida);
+static int usb_major;
 
 static int my_open(struct inode *inode, struct file *file) {
 	struct usb_mydev *dev;
@@ -196,6 +199,9 @@ static int usb_probe(struct usb_interface *interface, const struct usb_device_id
   int retval;
   
   struct usb_mydev *dev;
+
+	int minor;
+	dev_t dev_number;
   
   dev = kzalloc(sizeof(struct usb_mydev), GFP_KERNEL);
   if (!dev) {
@@ -285,7 +291,20 @@ static int usb_probe(struct usb_interface *interface, const struct usb_device_id
   
   pr_info("Using endpoints: IN=0x%02X OUT=0x%02X\n", dev->bulk_in_endpointAddr, dev->bulk_out_endpointAddr);
   
-  dev->devt = dev_number;
+	/* Allocate unique minor */
+	minor = ida_alloc(&usb_minor_ida, GFP_KERNEL);
+	if (minor < 0) {
+		pr_err("Failed to allocate minor\n");
+		return minor;
+	}
+
+	dev->minor = minor;
+
+	/* Create dev_t */
+	dev_number = MKDEV(usb_major, minor);
+
+	dev->devt = dev_number;
+	pr_info("Assigning device number %d:%d\n", MAJOR(dev_number), MINOR(dev_number));
   
   cdev_init(&dev->cdev, &fops);
   dev->cdev.owner = THIS_MODULE;
@@ -297,7 +316,7 @@ static int usb_probe(struct usb_interface *interface, const struct usb_device_id
   }
   
   /* Create device node*/
-  if (IS_ERR(device_create(my_class, &interface->dev, dev->devt, NULL, "my_usb_device"))) {
+  if (IS_ERR(device_create(my_class, &interface->dev, dev->devt, NULL, "my_usb_device%d", dev->minor))) {
   	pr_err("Cannot create device\n");
   	retval = -EINVAL;
   	goto error_device;
@@ -315,7 +334,8 @@ static int usb_probe(struct usb_interface *interface, const struct usb_device_id
   error_buf:
 		kfree(dev->bulk_out_buffer);
 		kfree(dev->bulk_in_buffer);
-	
+
+		ida_free(&usb_minor_ida, dev->minor);
 		usb_put_dev(dev->udev);
 		kfree(dev);
 		
@@ -336,6 +356,7 @@ static void usb_disconnect(struct usb_interface *interface) {
 	
 	device_destroy(my_class, dev->devt);
   cdev_del(&dev->cdev);
+	ida_free(&usb_minor_ida, dev->minor);
   
   kfree(dev->bulk_in_buffer);
   kfree(dev->bulk_out_buffer);
@@ -356,40 +377,45 @@ static struct usb_driver my_usb_driver = {
 
 static int __init usb_module_init(void) {
   int result;
-  
-  result = usb_register(&my_usb_driver);
-  if (result < 0) {
-    pr_err("USB registration failed for %s\n", my_usb_driver.name);
-    return -result;
-  }
+	dev_t dev;
   
   pr_info("USB module initialized\n");
   
   /* Allocating major/minor numbers */
-  if (alloc_chrdev_region(&dev_number, 0, 1, "my_usb_dev") < 0) {
+  if (alloc_chrdev_region(&dev, 0, 256, "my_usb_dev") < 0) {
   	pr_err("Cannot allocate chrdev\n");
-  	usb_deregister(&my_usb_driver);
   	return -1;
   }
+
+	usb_major = MAJOR(dev);
   
   /* Create class*/
   my_class = class_create("my_usb_class");
   if (IS_ERR(my_class)) {
   	pr_err("Cannot create class\n");
-  	unregister_chrdev_region(dev_number, 1);
-		usb_deregister(&my_usb_driver);
+  	unregister_chrdev_region(dev, 1);
   	return -1;
+  }
+
+	result = usb_register(&my_usb_driver);
+  if (result < 0) {
+    pr_err("USB registration failed for %s\n", my_usb_driver.name);
+		class_destroy(my_class);
+    unregister_chrdev_region(dev, 256);
+    return -result;
   }
   
   return 0;
 }
 
 static void __exit usb_module_exit(void) {
+	dev_t dev_number = MKDEV(usb_major, 0);
+
   usb_deregister(&my_usb_driver);
   pr_info("USB module exited\n");
   
 	class_destroy(my_class);
-	unregister_chrdev_region(dev_number, 1);
+	unregister_chrdev_region(dev_number, 256);
 	pr_info("Char device destroyed\n");
 }
 
