@@ -26,6 +26,9 @@ struct usb_mydev {
 
 	/* URB */
 	struct urb *bulk_in_urb;
+	wait_queue_head_t read_queue;
+	size_t data_size;
+	bool data_available;
 	
 	/* Char device */
 	struct cdev             cdev;
@@ -81,7 +84,7 @@ static int my_release(struct inode *inode, struct file *file) {
 static ssize_t my_read(struct file *file, char __user *buf, size_t len, loff_t *offset) {
 	struct usb_mydev *dev;
 	int retval;
-	int read_cnt;
+	// int read_cnt;
 	
 	dev = file->private_data;
 	
@@ -96,17 +99,30 @@ static ssize_t my_read(struct file *file, char __user *buf, size_t len, loff_t *
 	/* Lock */
 	mutex_lock(&dev->io_mutex);
 	
+	/* Read from USB */
+	retval = wait_event_interruptible(dev->read_queue,
+																		dev->data_available || dev->disconnected);
+		
+	if (retval) {
+		mutex_unlock(&dev->io_mutex);
+		return retval;
+	}
+
 	if (dev->disconnected) {
 		mutex_unlock(&dev->io_mutex);
 		return -ENODEV;
 	}
-	
-	/* Limit size */
+
+	/* Limit size*/
+	if (len > dev->data_size) {
+		len = dev->data_size;
+	}
+
+	/*
 	if (len > dev->bulk_in_size) {
 		len = dev->bulk_in_size;
 	}
-	
-	/* Read from USB */
+
 	retval = usb_bulk_msg(dev->udev,
 					 usb_rcvbulkpipe(dev->udev, dev->bulk_in_endpointAddr),
 					 dev->bulk_in_buffer,
@@ -118,18 +134,21 @@ static ssize_t my_read(struct file *file, char __user *buf, size_t len, loff_t *
 		mutex_unlock(&dev->io_mutex);
 		return retval;
 	}
+	*/
 	
 	/* Copy to user */
-	if (copy_to_user(buf, dev->bulk_in_buffer, read_cnt)) {
+	if (copy_to_user(buf, dev->bulk_in_buffer, len)) {
 		mutex_unlock(&dev->io_mutex);
 		return -EFAULT;
 	}
+
+	dev->data_available = false;
 	
-	pr_info("Read %d bytes from USB device\n", read_cnt);
+	pr_info("Read %zu bytes from USB device\n", len);
 	
 	mutex_unlock(&dev->io_mutex);
 	
-	return read_cnt;
+	return len;
 }
 
 static ssize_t my_write(struct file *file, const char __user *buf, size_t len, loff_t *offset) {
@@ -197,6 +216,7 @@ static struct file_operations fops = {
 
 static void bulk_in_callback(struct urb *urb) {
 	struct usb_mydev *dev = urb->context;
+	int retval;
 
 	if (!dev) {
 		return;
@@ -212,7 +232,19 @@ static void bulk_in_callback(struct urb *urb) {
 		return;
 	}
 
+	dev->data_size = urb->actual_length;
+	dev->data_available = true;
+
+	wake_up_interruptible(&dev->read_queue);
+
 	pr_info("URB received %d bytes\n", urb->actual_length);
+
+	if (!dev->disconnected) {
+		retval = usb_submit_urb(urb, GFP_ATOMIC);
+		if (retval) {
+			pr_err("Failed to resumbit urb: %d\n", retval);
+		}
+	}
 }
 
 static int usb_probe(struct usb_interface *interface, const struct usb_device_id *id) {
@@ -237,6 +269,11 @@ static int usb_probe(struct usb_interface *interface, const struct usb_device_id
   
   mutex_init(&dev->io_mutex);
   dev->disconnected = false;
+
+	init_waitqueue_head(&dev->read_queue);
+
+	dev->data_available = false;
+	dev->data_size = 0;
   
   iface_desc = interface->cur_altsetting;
   
@@ -409,6 +446,7 @@ static void usb_disconnect(struct usb_interface *interface) {
 
 	usb_kill_urb(dev->bulk_in_urb);
 	usb_free_urb(dev->bulk_in_urb);
+	wake_up_interruptible(&dev->read_queue);
   
   kfree(dev->bulk_in_buffer);
   kfree(dev->bulk_out_buffer);
