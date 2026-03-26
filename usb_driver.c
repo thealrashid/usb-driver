@@ -23,6 +23,9 @@ struct usb_mydev {
 	unsigned char           bulk_out_endpointAddr;
 	size_t                  bulk_out_size;
 	unsigned char           *bulk_out_buffer;
+
+	/* URB */
+	struct urb *bulk_in_urb;
 	
 	/* Char device */
 	struct cdev             cdev;
@@ -192,6 +195,26 @@ static struct file_operations fops = {
 	.write = my_write,
 };
 
+static void bulk_in_callback(struct urb *urb) {
+	struct usb_mydev *dev = urb->context;
+
+	if (!dev) {
+		return;
+	}
+
+	if (urb->status) {
+		if (urb->status == -ESHUTDOWN || urb->status == -ENOENT) {
+			pr_info("URB stopped (device removed)\n");
+		} else {
+			pr_err("URB error: %d\n", urb->status);
+		}
+		
+		return;
+	}
+
+	pr_info("URB received %d bytes\n", urb->actual_length);
+}
+
 static int usb_probe(struct usb_interface *interface, const struct usb_device_id *id) {
   struct usb_host_interface *iface_desc;
   struct usb_endpoint_descriptor *endpoint;
@@ -290,6 +313,28 @@ static int usb_probe(struct usb_interface *interface, const struct usb_device_id
   }
   
   pr_info("Using endpoints: IN=0x%02X OUT=0x%02X\n", dev->bulk_in_endpointAddr, dev->bulk_out_endpointAddr);
+
+	dev->bulk_in_urb = usb_alloc_urb(0, GFP_KERNEL);
+	if (!dev->bulk_in_urb) {
+		pr_err("Failed to allocate URB\n");
+		retval = -ENOMEM;
+		goto error_buf;
+	}
+
+	usb_fill_bulk_urb(dev->bulk_in_urb,
+										dev->udev,
+										usb_rcvbulkpipe(dev->udev, dev->bulk_in_endpointAddr),
+										dev->bulk_in_buffer,
+										dev->bulk_in_size,
+										bulk_in_callback,
+										dev);
+	
+	retval = usb_submit_urb(dev->bulk_in_urb, GFP_KERNEL);
+	if (retval) {
+		pr_err("Failed to submit URB: %d\n", retval);
+		usb_free_urb(dev->bulk_in_urb);
+		goto error_buf;
+	}
   
 	/* Allocate unique minor */
 	minor = ida_alloc(&usb_minor_ida, GFP_KERNEL);
@@ -335,6 +380,10 @@ static int usb_probe(struct usb_interface *interface, const struct usb_device_id
 		kfree(dev->bulk_out_buffer);
 		kfree(dev->bulk_in_buffer);
 
+		if(dev->bulk_in_urb) {
+			usb_free_urb(dev->bulk_in_urb);
+		}
+
 		ida_free(&usb_minor_ida, dev->minor);
 		usb_put_dev(dev->udev);
 		kfree(dev);
@@ -357,6 +406,9 @@ static void usb_disconnect(struct usb_interface *interface) {
 	device_destroy(my_class, dev->devt);
   cdev_del(&dev->cdev);
 	ida_free(&usb_minor_ida, dev->minor);
+
+	usb_kill_urb(dev->bulk_in_urb);
+	usb_free_urb(dev->bulk_in_urb);
   
   kfree(dev->bulk_in_buffer);
   kfree(dev->bulk_out_buffer);
