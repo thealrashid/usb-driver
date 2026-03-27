@@ -10,6 +10,10 @@
 #include <linux/mutex.h>
 #include <linux/idr.h>
 
+#define BUF_SIZE 4096
+#define BUF_COUNT(dev) ((dev->head - dev->tail + BUF_SIZE) % BUF_SIZE)
+#define BUF_SPACE(dev) (BUF_SIZE - BUF_COUNT(dev) - 1)
+
 struct usb_mydev {
 	struct usb_device    *udev;
 	struct usb_interface *interface;
@@ -27,8 +31,9 @@ struct usb_mydev {
 	/* URB */
 	struct urb *bulk_in_urb;
 	wait_queue_head_t read_queue;
-	size_t data_size;
-	bool data_available;
+	unsigned char circ_buf[BUF_SIZE];
+	size_t head;
+	size_t tail;
 	
 	/* Char device */
 	struct cdev             cdev;
@@ -84,7 +89,7 @@ static int my_release(struct inode *inode, struct file *file) {
 static ssize_t my_read(struct file *file, char __user *buf, size_t len, loff_t *offset) {
 	struct usb_mydev *dev;
 	int retval;
-	// int read_cnt;
+	size_t count;
 	
 	dev = file->private_data;
 	
@@ -101,7 +106,7 @@ static ssize_t my_read(struct file *file, char __user *buf, size_t len, loff_t *
 	
 	/* Read from USB */
 	retval = wait_event_interruptible(dev->read_queue,
-																		dev->data_available || dev->disconnected);
+																		BUF_COUNT(dev) > 0 || dev->disconnected);
 		
 	if (retval) {
 		mutex_unlock(&dev->io_mutex);
@@ -114,8 +119,17 @@ static ssize_t my_read(struct file *file, char __user *buf, size_t len, loff_t *
 	}
 
 	/* Limit size*/
-	if (len > dev->data_size) {
-		len = dev->data_size;
+	count = BUF_COUNT(dev);
+	if (len > count) {
+		len = count;
+	}
+
+	/* Copy to user */
+	for (size_t i = 0; i < len; i++) {
+		if (copy_to_user(buf + i, &dev->circ_buf[dev->tail], 1)) {
+			mutex_unlock(&dev->io_mutex);
+			return -EFAULT;
+		}
 	}
 
 	/*
@@ -135,14 +149,6 @@ static ssize_t my_read(struct file *file, char __user *buf, size_t len, loff_t *
 		return retval;
 	}
 	*/
-	
-	/* Copy to user */
-	if (copy_to_user(buf, dev->bulk_in_buffer, len)) {
-		mutex_unlock(&dev->io_mutex);
-		return -EFAULT;
-	}
-
-	dev->data_available = false;
 	
 	pr_info("Read %zu bytes from USB device\n", len);
 	
@@ -222,6 +228,24 @@ static void bulk_in_callback(struct urb *urb) {
 		return;
 	}
 
+	unsigned char *data = dev->bulk_in_buffer;
+	size_t len = urb->actual_length;
+
+	mutex_lock(&dev->io_mutex);
+
+	/* Copy into circular buffer */
+	for (size_t i; i < len; i++) {
+		if (BUF_SPACE(dev) == 0) {
+			pr_warn("Buffer full, dropping data\n");
+			break;
+		}
+
+		dev->circ_buf[dev->head] = data[i];
+		dev->head = (dev->head + 1) % BUF_SIZE;
+	}
+
+	mutex_unlock(&dev->io_mutex);
+
 	if (urb->status) {
 		if (urb->status == -ESHUTDOWN || urb->status == -ENOENT) {
 			pr_info("URB stopped (device removed)\n");
@@ -232,12 +256,9 @@ static void bulk_in_callback(struct urb *urb) {
 		return;
 	}
 
-	dev->data_size = urb->actual_length;
-	dev->data_available = true;
-
 	wake_up_interruptible(&dev->read_queue);
 
-	pr_info("URB received %d bytes\n", urb->actual_length);
+	pr_info("URB received %zu bytes\n", len);
 
 	if (!dev->disconnected) {
 		retval = usb_submit_urb(urb, GFP_ATOMIC);
@@ -268,12 +289,13 @@ static int usb_probe(struct usb_interface *interface, const struct usb_device_id
   dev->interface = interface;
   
   mutex_init(&dev->io_mutex);
+
   dev->disconnected = false;
 
 	init_waitqueue_head(&dev->read_queue);
 
-	dev->data_available = false;
-	dev->data_size = 0;
+	dev->head = 0;
+	dev->tail = 0;
   
   iface_desc = interface->cur_altsetting;
   
