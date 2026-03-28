@@ -103,6 +103,13 @@ static ssize_t my_read(struct file *file, char __user *buf, size_t len, loff_t *
 	
 	/* Lock */
 	mutex_lock(&dev->io_mutex);
+
+	if (file->f_flags & O_NONBLOCK) {
+		if (BUF_COUNT(dev) == 0) {
+			mutex_unlock(&dev->io_mutex);
+			return -EAGAIN;
+		}
+	}
 	
 	/* Read from USB */
 	retval = wait_event_interruptible(dev->read_queue,
