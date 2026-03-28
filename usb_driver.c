@@ -9,6 +9,7 @@
 #include <linux/slab.h>
 #include <linux/mutex.h>
 #include <linux/idr.h>
+#include <linux/poll.h>
 
 #define BUF_SIZE 4096
 #define BUF_COUNT(dev) ((dev->head - dev->tail + BUF_SIZE) % BUF_SIZE)
@@ -219,12 +220,37 @@ static ssize_t my_write(struct file *file, const char __user *buf, size_t len, l
 	return wrote_cnt;
 }
 
+static __poll_t my_poll(struct file *file, poll_table *wait) {
+	struct usb_mydev *dev = file->private_data;
+	__poll_t mask = 0;
+
+	if (!dev) {
+		return EPOLLERR;
+	}
+
+	/* Register wait queue */
+	poll_wait(file, &dev->read_queue, wait);
+
+	mutex_lock(&dev->io_mutex);
+
+	if (dev->disconnected) {
+		mask |= EPOLLHUP | EPOLLERR;
+	} else if (BUF_COUNT(dev) > 0) {
+		mask |= EPOLLIN | EPOLLRDNORM;
+	}
+
+	mutex_unlock(&dev->io_mutex);
+
+	return mask;
+}
+
 static struct file_operations fops = {
 	.owner = THIS_MODULE,
 	.open = my_open,
 	.release = my_release,
 	.read = my_read,
 	.write = my_write,
+	.poll = my_poll,
 };
 
 static void bulk_in_callback(struct urb *urb) {
